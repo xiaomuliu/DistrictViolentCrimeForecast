@@ -1,0 +1,520 @@
+---
+title: "District and Beat Forecast"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+<!-- The process starts with an on-line citywide violent crime temporal model then the prediction is allocated to nodes/pixels according to the weights associated with each node/pixel. The nodal/pixel values are estimated through crime density reconstruction process. The intensity value $\lambda(x,y,t)$ on an fine grid (evalutation grid) is obtained through spatial interpolation. And the crime rate of an arbitrary region and time interval can be calulated by integrating (summing) over all the $\lambda$'s inside that region and/or over that period of time. -->
+
+<!-- We simplify the testing by using a fixed mesh structure (obtained from 2009-2010 data).Then we estimate nodal values using 2-year data (in a sliding-window fasion). Finally we compare with some beat-wise long-term and short-term historic averages. -->
+
+```{r load-crime-data,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+setwd("/Users/xiaomuliu/CrimeProject/SpatioTemporalModeling/RegionEval/")
+source("LoadDailyCrimeData.R")
+```
+```{r detrending,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+source("Detrend.R")
+```
+
+```{r load-weather-data,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+## Load weather data
+source("LoadWeatherData.R")
+```
+
+```{r ts-test-spec,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+source("EvalConfig.R")
+```
+
+```{r city-ts-pred,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+source("MovingWinEval.R")
+```
+
+```{r eval-ts,echo=FALSE, message=FALSE, warning=FALSE, eval=FALSE, cache=TRUE}
+source("TimeSeriesEval.R")
+```
+
+<!-- # Allocate daily predications to mesh nodes/pixels -->
+
+```{r set-eval-grid,echo=FALSE, message=FALSE, warning=FALSE, include=FALSE, cache=TRUE}
+source("SetupGrid.R")
+```
+```{r load-func,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+source("IMfunction.R")
+source("MeshGenFunction.R")
+source("PixGenFunction.R")
+source("MeshReconFunction.R")
+source("PixReconFunction.R")
+```
+
+<!-- We set the expected number of nodes to 800 for mesh node placement (as well as the size of pixel grid inside the city boundary). The reconstruction is done by MAP estimation with the smoothing parameter 0.0001. The nodal/pixel value estimation is updated daily.  -->
+
+```{r test-spec,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+h <- grd.full@grid@cellsize  # kernel bandwidth for KDE
+ENode <- 800 # expected number of mesh nodes
+bndyPercent <- 0.1 # the percent of nodes on boundary
+SmParam <- 10^(-4) # Gibbs prior parameter
+iterMax <- 30 # maximal EM iterations
+reltol <- 1e-8 # relevance tolerance for convergence
+eps <- 1e-20 # small value to replace zeros in Possion rate
+meshHistSpan <- 365*2 # time span of observed data for generating mesh
+meshObsSpan <- 365*2
+
+# Extract City Boundary 
+isInCity2_mat <- matrix(isInCity2,nrow=r@ncols,ncol=r@nrows)
+Bndy_mat <- DetectEdge(isInCity2_mat)
+isOnBndy <- as.vector(Bndy_mat) 
+BndyNode <- round(bndyPercent*ENode)
+
+NumDays.eval <- length(dateSeq.eval)
+
+# A matrix storing the predicted crime rate maps where the row corresponds to (vectorized) regular grid (inside city area)
+# and each column corresponds to date for evaluation
+KDE.Hist_full <- KDEgrd.full[,c("X_COORD","Y_COORD")]
+KDE.Hist_inCity <- KDE.Hist_full[isInCity2,]
+RateMap_mesh.eval <- matrix(0,ncol=NumDays.eval,nrow=nrow(KDE.Hist_inCity)) 
+```
+
+```{r true-den,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# Long-term historical inicident data are used for arranging mesh nodes 
+# (One placement of mesh nodes will be fixed for all the evaluation days while the estimates of nodal values vary)
+startDate.mesh <- startDate.eval-meshHistSpan
+endDate.mesh <- startDate.eval-1
+CrimeHistPts <- subset(CrimeData,DATEOCC>=startDate.mesh & DATEOCC<=endDate.mesh,select=c("X_COORD","Y_COORD","INC_CNT"))
+CrimeHistPts.raster <- rasterize(CrimeHistPts[,c("X_COORD","Y_COORD")], r, CrimeHistPts$INC_CNT, fun=sum)
+CrimeHistPts.df_inCity <- as.data.frame(CrimeHistPts.raster,xy=TRUE)[isInCity,]
+names(CrimeHistPts.df_inCity) <- c("X_COORD","Y_COORD","INC_CNT")
+CrimeHistPts.df_inCity$INC_CNT[is.na(CrimeHistPts.df_inCity$INC_CNT)] <- 0
+CrimeHistPts.df_inCity <- CrimeHistPts.df_inCity[ord.R2K,] # convert pixel order from "RegGrd" to "KDEgrd"
+```
+
+```{r place-mesh,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# generate mesh grid
+meshList <- generateConstraintMesh2(CrimeHistPts,r,KDEgrd.full,ENode,isOnBndy,BndyNode,bw=h,plot=FALSE)
+MeshNode_raw <- meshList$meshNode
+MeshTri <- meshList$Tri
+```
+
+<!-- Mesh structure -->
+```{r plot-mesh,echo=FALSE, message=FALSE, warning=FALSE, fig.width=7,fig.height=4, fig.align='center', eval=FALSE,cache=TRUE}
+DenIm <- meshList$pixelIm
+MeshNode <- meshList$meshNode
+triSides <- meshList$triSides
+jet.colors <- colorRampPalette(c("#00007F", "blue", "#007FFF", "cyan", "#7FFF7F", "yellow", "#FF7F00", "red", "#7F0000"))
+X_range <- range(KDEgrd.full$X_COORD)
+Y_range <- range(KDEgrd.full$Y_COORD)
+par(mfrow=c(1,2),oma=c(0,0,0,0))
+image(x=seq(X_range[1],X_range[2],length.out=r@ncols),y=seq(Y_range[1],Y_range[2],length.out=r@nrows),
+      z=DenIm,col=jet.colors(256),xlab="X coordinate",ylab="Y coordinate",main="KDE of 2001-2011 violent crime",
+      cex.main=0.7,cex.axis=0.7,cex.lab=0.7)
+plot.new()
+plot.window(xlim=c(X_range[1],X_range[2]),ylim=c(Y_range[1],Y_range[2]))
+axis(1,lwd.ticks=0.7,cex.axis=0.7)
+axis(2,lwd.ticks=0.7,cex.axis=0.7)
+box()
+segments(MeshNode[triSides[, 1], 1], MeshNode[triSides[, 1], 2], MeshNode[triSides[, 2], 1], MeshNode[triSides[, 2], 2], 
+         col="blue",lwd=0.5)
+```
+
+```{r test-loop,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+for (i in 1:NumDays.eval){
+  d <- dateSeq.eval[i]
+  startDate.obs <- d-meshObsSpan
+  endDate.obs <- d-1
+  
+  # Observed incidents are used for estimating nodal/pixel values
+  CrimeObsPts <- subset(CrimeData,DATEOCC>=startDate.obs & DATEOCC<=endDate.obs,select=c("X_COORD","Y_COORD","INC_CNT"))
+  CrimeObsPts.raster <- rasterize(CrimeObsPts[,c("X_COORD","Y_COORD")], r, CrimeObsPts$INC_CNT, fun=sum)
+  CrimeObsPts.df_full <- as.data.frame(CrimeObsPts.raster,xy=TRUE)
+  names(CrimeObsPts.df_full) <- c("X_COORD","Y_COORD","INC_CNT")
+  CrimeObsPts.df_full$INC_CNT[is.na(CrimeObsPts.df_full$INC_CNT)] <- 0
+  
+  # Used for mesh reconstruction (only needs grids inside the city area)
+  CrimeObsPts.df_inCity <- CrimeObsPts.df_full[isInCity,]
+  CrimeObsPts.df_inCity <- CrimeObsPts.df_inCity[ord.R2K,] # convert pixel order from "RegGrd" to "KDEgrd"
+  
+  # Mesh-MAP recon
+  Recon_city.meshMAP <- MeshRecon(CrimeObsPts.df_inCity,MeshNode_raw,MeshTri,KDEgrd,iterMax=iterMax,
+                                  Estimation="MAP",SmoothParam=SmParam)$Recon.city
+  Recon_city.meshMAP$DENVAL <- Recon_city.meshMAP$VALUE/sum(Recon_city.meshMAP$VALUE) 
+  
+  RateMap_mesh.eval[,i] <- CrimeData.eval$TSpred[i] * Recon_city.meshMAP$DENVAL
+}
+
+# convert pixel order from "KDEgrd" to "RegGrd"
+RateMap_mesh.eval <- RateMap_mesh.eval[ord.K2R,]
+```
+
+<!-- ** Evalutaion ** -->
+<!-- Integrate (sum) the rates inside a police beat or district, which gives the expected number of crimes in that beat/district for that day -->
+<!-- Then evaluate the MSE based on the actual count. Compare with the historical incident count averages in that beat, specifically: -->
+*Evaluation example*  
+1 .Tomorrow's forecast - Friday, Aug 12, 2016. [*red*]  
+2. historical overall average number of crimes for a given District/Beat (how different is tomorrow from an average day in the past 5 years?) [*yellow*]  
+3. same, but for a given time of year (how different is tomorrow from an average August day in the past 5 years?) [*green*]  
+4. same, but for a given day-of-week at a given time of year (how different is tomorrow compared with an average Friday in August in the past 5 years?) [*blue*]  
+5. same, but for the three most recent Fridays [*purple*]  
+
+**BEAT**
+Each plot corresponds to all the beats in a district.
+```{r beat-grid,echo=FALSE, message=FALSE, warning=FALSE,include=FALSE, cache=TRUE}
+Path.beat <- paste0(Path.GIS,"cpd_beats")
+beat.shp <- readOGR(Path.beat, "cpd_beats")
+
+beat_template.spdf <- beat.shp
+# remove some useless/redundant attributes
+beat_template.spdf@data$SECTOR <- NULL
+beat_template.spdf@data$BEAT <- NULL
+beat_template.spdf@data$BEAT_NUM <- NULL
+
+beatList <- sort(unique(beat_template.spdf$BEAT_NUMBE))
+beatList <- beatList[beatList!='3100'] # remove beat '3100', a dummy beat without examples
+NumBeat <- length(beatList)
+
+RegGrd.sp <- SpatialPixels(city.df_full[isInCity])
+GrdInBeat <- over(RegGrd.sp,beat_template.spdf)
+GrdInBeat <- subset(cbind(GrdInBeat, RegGrd.sp@coords),select=-c(OBJECTID))
+names(GrdInBeat)[names(GrdInBeat)=="BEAT_NUMBE"] <- "BEAT"
+GrdInBeat <- subset(GrdInBeat,select=c("BEAT","X_COORD","Y_COORD"))
+# Assign the grid cells that have missing values for BEAT to the nearest beats
+BeatCtr <- coordinates(beat.shp) # centroids 
+OutBoundPix <- which(is.na(GrdInBeat$BEAT))
+for (i in OutBoundPix){
+  distVec <- apply(BeatCtr-matrix(rep(as.matrix(GrdInBeat[i,c("X_COORD","Y_COORD")]),nrow(BeatCtr)),ncol=2,byrow=TRUE),
+                   MARGIN=1,FUN=function(x){x[1]^2+x[2]^2})
+  GrdInBeat$BEAT[i] <- beat_template.spdf@data$BEAT_NUMBE[which.min(distVec)]
+}
+```
+
+```{r beat-panel-data,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+CrimeData.beat_day <- aggregate(INC_CNT~BEAT+DISTRICT+DATEOCC+YEAR+MONTH+DOW+HOLIDAY,data=CrimeData,FUN=sum,na.rm=TRUE)
+CrimeData.beat_day <- CrimeData.beat_day[order(CrimeData.beat_day$DATEOCC),]
+CrimeData.beat_day$DOW <- factor(CrimeData.beat_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+
+period.short <- 21
+period.long <- 5*365
+
+# Create a full panel (of size "number of beats * number of dates") data frame
+source("ConstructPanelData.R")
+CrimeData.eval_beat <- subset(CrimeData.beat_day,DATEOCC>=startDate.eval&DATEOCC<=endDate.eval&BEAT!='3100')
+CrimeData.eval_beat <- CrimeData.eval_beat[order(CrimeData.eval_beat$DATEOCC,CrimeData.eval_beat$BEAT),]
+CrimeData.eval_beat <- ConstructPanelData(CrimeData.eval_beat,beat_template.spdf,area="BEAT",AreaList=beatList) 
+CrimeData.eval_beat$Pred_LT <- rep(0,nrow(CrimeData.eval_beat))
+CrimeData.eval_beat$Pred_histMonth <- rep(0,nrow(CrimeData.eval_beat))
+CrimeData.eval_beat$Pred_histDOW <- rep(0,nrow(CrimeData.eval_beat))
+CrimeData.eval_beat$Pred_recentDOW <- rep(0,nrow(CrimeData.eval_beat))
+
+# Add corresponding district numbers for each beat (optional)
+inDistrict <- aggregate(.~BEAT_NUMBE,data=beat_template.spdf@data[,c("DISTRICT","BEAT_NUMBE")],FUN=function(x){x[1]})
+names(inDistrict)[names(inDistrict)=="BEAT_NUMBE"] <- "BEAT"
+inDistrict$DISTRICT <- factor(inDistrict$DISTRICT)
+levels(inDistrict$DISTRICT) <- levels(CrimeData$DISTRICT)
+inDistrict <- inDistrict[inDistrict$DISTRICT!='031',] # remove Distirct '031' 
+
+for (i in 1:nrow(inDistrict)){
+  CrimeData.eval_beat$DISTRICT[CrimeData.eval_beat$BEAT==inDistrict$BEAT[i]] <- inDistrict$DISTRICT[i]
+}
+```
+
+```{r baseline-beat,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+for (i in 1:NumDays.eval){
+  d <- dateSeq.eval[i]
+  d.year <- as.integer(format(d,"%Y"))
+  d.month <- as.integer(format(d,"%m"))
+  d.dow <- weekdays(d)
+  CrimeData.beat_day_long <- subset(CrimeData.beat_day,YEAR>=(d.year-5) & YEAR<d.year,select=c("DATEOCC","MONTH","BEAT","INC_CNT"))
+  CrimeData.beat_day_histMonth <- subset(CrimeData.beat_day_long,MONTH==d.month,select=c("DATEOCC","BEAT","INC_CNT"))
+  CrimeData.beat_day_histDOW <- subset(CrimeData.beat_day_long,MONTH==d.month & weekdays(DATEOCC)==d.dow,
+                                       select=c("DATEOCC","BEAT","INC_CNT"))
+  CrimeData.beat_day_recentDOW <- subset(CrimeData.beat_day,DATEOCC>=d-period.short & DATEOCC<=d-1 &  weekdays(DATEOCC)==d.dow,
+                                         select=c("DATEOCC","BEAT","INC_CNT"))
+  for (j in beatList){
+    targetIdx <- CrimeData.eval_beat$BEAT==j&CrimeData.eval_beat$DATEOCC==d
+    BeatCnt.long <- subset(CrimeData.beat_day_long,BEAT==j)
+    BeatCnt.histMonth <- subset(CrimeData.beat_day_histMonth,BEAT==j)
+    BeatCnt.histDOW <- subset(CrimeData.beat_day_histDOW,BEAT==j)
+    BeatCnt.recentDOW <- subset(CrimeData.beat_day_recentDOW,BEAT==j)
+    # Some beats may have no incident records during the long/short periods
+    if (nrow(BeatCnt.long)==0){
+      CrimeData.eval_beat$Pred_LT[targetIdx] <- 0
+      CrimeData.eval_beat$Pred_histMonth[targetIdx] <- 0
+      CrimeData.eval_beat$Pred_histDOW[targetIdx] <- 0
+      CrimeData.eval_beat$Pred_recentDOW[targetIdx] <- 0
+    }else if (nrow(BeatCnt.histMonth)==0){
+      CrimeData.eval_beat$Pred_histMonth[targetIdx] <- 0
+      CrimeData.eval_beat$Pred_histDOW[targetIdx] <- 0
+    }else if (nrow(BeatCnt.histDOW)==0){
+      CrimeData.eval_beat$Pred_histDOW[targetIdx] <- 0
+    }else if (nrow(BeatCnt.recentDOW)==0){
+      CrimeData.eval_beat$Pred_recentDOW[targetIdx] <- 0
+    }else{
+      CrimeData.eval_beat$Pred_LT[targetIdx] <- mean(BeatCnt.long$INC_CNT)
+      CrimeData.eval_beat$Pred_histMonth[targetIdx] <- mean(BeatCnt.histMonth$INC_CNT)
+      CrimeData.eval_beat$Pred_histDOW[targetIdx] <- mean(BeatCnt.histDOW$INC_CNT) 
+      CrimeData.eval_beat$Pred_recentDOW[targetIdx] <- mean(BeatCnt.recentDOW$INC_CNT) 
+    }
+  }
+}
+```
+
+```{r beat-rate-sum,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+# Set reorder=TRUE, the result will be in order of sort(unique(group)) which is indentical to beatList. 
+# BeatPred is of dimension 'number of beats * number of evaluation days'
+BeatPred.mesh <- rowsum(RateMap_mesh.eval,group=GrdInBeat$BEAT,reorder=TRUE,na.rm=TRUE)  
+
+# Fill beat predictions into CrimeData.eval_beat data frame
+for (i in 1:NumDays.eval){
+  CrimeData.eval_beat$Pred_mesh[CrimeData.eval_beat$DATEOCC==dateSeq.eval[i]] <- BeatPred.mesh[,i]
+}
+```
+
+```{r eval-func,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+MSE <- function(x,x_hat){return(mean((x-x_hat)^2))}
+percentMSE <- function(x,x_hat){return(MSE(x,x_hat)/mean(x^2)*100)}
+RMSE <- function(x,x_hat){return(sqrt(MSE(x,x_hat)))}
+percentRMSE <- function(x,x_hat){return(RMSE(x,x_hat)/mean(abs(x))*100)}
+
+models <- c('TSpred','LT','histMonth','histDOW','recentDOW')
+NumModel <- length(models)
+```
+
+```{r eval-beat-dataframe,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+evalnames.beat <-c('BEAT','DISTRICT','MODEL','MSE','pMSE','RMSE','pRMSE')
+EvalResults.beat <- data.frame(matrix(0,nrow=NumBeat*NumModel,ncol=length(evalnames.beat)))
+names(EvalResults.beat) <- evalnames.beat
+
+EvalResults.beat$BEAT <- rep(beatList,each=NumModel)
+
+for (i in 1:nrow(inDistrict)){
+  EvalResults.beat$DISTRICT[EvalResults.beat$BEAT==inDistrict$BEAT[i]] <- inDistrict$DISTRICT[i]
+}
+EvalResults.beat$DISTRICT <- factor(EvalResults.beat$DISTRICT)
+levels(EvalResults.beat$DISTRICT) <- levels(inDistrict$DISTRICT)
+districtList <- sort(unique(inDistrict$DISTRICT))
+
+EvalResults.beat$MODEL <- factor(rep(models,times=NumBeat))
+idx.model <- matrix(FALSE,nrow=nrow(EvalResults.beat),ncol=NumModel)
+for (i in 1:NumModel){
+  idx.model[,i] <- EvalResults.beat$MODEL==models[i]
+}
+
+for (i in beatList){
+  BeatRecord <- subset(CrimeData.eval_beat,BEAT==i,
+                       select=c("INC_CNT","Pred_mesh","Pred_LT","Pred_histMonth","Pred_histDOW","Pred_recentDOW"))
+  
+  idx.beat <- EvalResults.beat$BEAT==i
+  
+  EvalResults.beat$MSE[idx.beat&idx.model[,1]] <- with(BeatRecord,MSE(INC_CNT,Pred_mesh))
+  EvalResults.beat$MSE[idx.beat&idx.model[,2]] <- with(BeatRecord,MSE(INC_CNT,Pred_LT))
+  EvalResults.beat$MSE[idx.beat&idx.model[,3]] <- with(BeatRecord,MSE(INC_CNT,Pred_histMonth))
+  EvalResults.beat$MSE[idx.beat&idx.model[,4]] <- with(BeatRecord,MSE(INC_CNT,Pred_histDOW))
+  EvalResults.beat$MSE[idx.beat&idx.model[,5]] <- with(BeatRecord,MSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.beat$pMSE[idx.beat&idx.model[,1]] <- with(BeatRecord,percentMSE(INC_CNT,Pred_mesh))
+  EvalResults.beat$pMSE[idx.beat&idx.model[,2]] <- with(BeatRecord,percentMSE(INC_CNT,Pred_LT))
+  EvalResults.beat$pMSE[idx.beat&idx.model[,3]] <- with(BeatRecord,percentMSE(INC_CNT,Pred_histMonth))
+  EvalResults.beat$pMSE[idx.beat&idx.model[,4]] <- with(BeatRecord,percentMSE(INC_CNT,Pred_histDOW))
+  EvalResults.beat$pMSE[idx.beat&idx.model[,5]] <- with(BeatRecord,percentMSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.beat$RMSE[idx.beat&idx.model[,1]] <- with(BeatRecord,RMSE(INC_CNT,Pred_mesh))
+  EvalResults.beat$RMSE[idx.beat&idx.model[,2]] <- with(BeatRecord,RMSE(INC_CNT,Pred_LT))
+  EvalResults.beat$RMSE[idx.beat&idx.model[,3]] <- with(BeatRecord,RMSE(INC_CNT,Pred_histMonth))
+  EvalResults.beat$RMSE[idx.beat&idx.model[,4]] <- with(BeatRecord,RMSE(INC_CNT,Pred_histDOW))
+  EvalResults.beat$RMSE[idx.beat&idx.model[,5]] <- with(BeatRecord,RMSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.beat$pRMSE[idx.beat&idx.model[,1]] <- with(BeatRecord,percentRMSE(INC_CNT,Pred_mesh))
+  EvalResults.beat$pRMSE[idx.beat&idx.model[,2]] <- with(BeatRecord,percentRMSE(INC_CNT,Pred_LT))
+  EvalResults.beat$pRMSE[idx.beat&idx.model[,3]] <- with(BeatRecord,percentRMSE(INC_CNT,Pred_histMonth))
+  EvalResults.beat$pRMSE[idx.beat&idx.model[,4]] <- with(BeatRecord,percentRMSE(INC_CNT,Pred_histDOW))
+  EvalResults.beat$pRMSE[idx.beat&idx.model[,5]] <- with(BeatRecord,percentRMSE(INC_CNT,Pred_recentDOW))
+}
+```
+
+<!-- The beat-wise crime rate prediction in terms of MSE and MSE% (Each graph shows the beats in the corresponding district). -->
+*MSE and MSE%*
+```{r plot-beat-eval,echo=FALSE, message=FALSE, warning=FALSE, fig.width=7,fig.height=5.5, fig.align='center', eval=TRUE,cache=TRUE}
+metrics <- c('MSE','pMSE')
+metricNames <- c('MSE','MSE%')
+for (j in 1:length(metrics)){
+  layout(matrix(c(1,2,3,4,5,5), ncol=2, byrow=TRUE), heights=c(4, 4, 1))
+  subfigCnt <- 0
+  for (i in districtList){
+    par(mar=c(5,4,4,2),pty='m')
+    EvalDistrict <- subset(EvalResults.beat,DISTRICT==i,select=c('BEAT','MODEL',metrics[j]))
+    # reshape to contingency-table form (long-format to wide-format)
+    EvalDistrict.wide <- stats::reshape(EvalDistrict,direction='wide',v.names=metrics[j],timevar='BEAT',idvar='MODEL')
+    names(EvalDistrict.wide)[-1] <- as.character(sort(unique(EvalDistrict$BEAT)))
+    barplot(as.matrix(EvalDistrict.wide[,-1]), main=paste("DISTRICT",i),xlab="BEAT",ylab=metricNames[j], 
+            col=rainbow(length(models)), beside=TRUE,cex.main=0.7,cex.lab=0.7,cex.axis=0.7)
+    subfigCnt <- subfigCnt+1
+    if (subfigCnt %% 4==0 | subfigCnt==length(districtList)){
+      par(mar=c(1,0,0,0))
+      plot.new()
+      legend(x="bottom",inset=c(0,0), legend=models, pch=15, col=c("red","yellow","green","blue"), 
+             cex=0.5, horiz=TRUE,xpd=NA)
+    }
+  }
+}
+```
+
+**DISTRICT**
+*MSE and MSE%*
+```{r district-grid,echo=FALSE, message=FALSE, warning=FALSE,include=FALSE, cache=TRUE}
+Path.district <- paste0(Path.GIS,"cpd_districts")
+district.shp <- readOGR(Path.district, "cpd_districts")
+
+district_template.spdf <- district.shp
+# remove some useless/redundant attributes
+district_template.spdf@data$DIST_LABEL <- NULL
+district_template.spdf@data$PDF <- NULL
+district_template.spdf@data$DIST_NUM <- NULL
+
+districtList <- sort(unique(district_template.spdf$DISTRICT))
+districtList <- districtList[districtList!='031'] # remove district '031', a dummy district without examples
+NumDistrict <- length(districtList)
+
+GrdInDistrict <- over(RegGrd.sp,district_template.spdf)
+GrdInDistrict <- subset(cbind(GrdInDistrict, RegGrd.sp@coords),select=-c(OBJECTID))
+# Assign the grid cells that have missing values for DISTRICT to the nearest beats
+DistrictCtr <- coordinates(district.shp) # centroids 
+OutBoundPix <- which(is.na(GrdInDistrict$DISTRICT))
+for (i in OutBoundPix){
+  distVec <- apply(DistrictCtr-matrix(rep(as.matrix(GrdInDistrict[i,c("X_COORD","Y_COORD")]),nrow(DistrictCtr)),ncol=2,byrow=TRUE),
+                   MARGIN=1,FUN=function(x){x[1]^2+x[2]^2})
+  GrdInDistrict$DISTRICT[i] <- district_template.spdf@data$DISTRICT[which.min(distVec)]
+}
+# There is one pixel corresponding to district 31. Change its district membership to the closest other district.
+OutBoundPix2 <- which(GrdInDistrict$DISTRICT=='031')
+for (i in OutBoundPix2){
+  distVec <- apply(DistrictCtr-matrix(rep(as.matrix(GrdInDistrict[i,c("X_COORD","Y_COORD")]),nrow(DistrictCtr)),ncol=2,byrow=TRUE),
+                   MARGIN=1,FUN=function(x){x[1]^2+x[2]^2})
+  GrdInDistrict$DISTRICT[i] <- district_template.spdf@data$DISTRICT[sort.int(distVec,index.return=T)$ix[2]]
+}
+```
+
+```{r district-panel-data,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+CrimeData.district_day <- aggregate(INC_CNT~DISTRICT+DATEOCC+YEAR+MONTH+DOW+HOLIDAY,data=CrimeData,FUN=sum,na.rm=TRUE)
+CrimeData.district_day <- CrimeData.district_day[order(CrimeData.district_day$DATEOCC),]
+CrimeData.district_day$DOW <- factor(CrimeData.district_day$DOW, levels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat"))
+
+CrimeData.eval_district <- subset(CrimeData.district_day,DATEOCC>=startDate.eval&DATEOCC<=endDate.eval&DISTRICT!='031')
+CrimeData.eval_district <- CrimeData.eval_district[order(CrimeData.eval_district$DATEOCC,CrimeData.eval_district$DISTRICT),]
+CrimeData.eval_district <- ConstructPanelData(CrimeData.eval_district,district_template.spdf,area="DISTRICT",AreaList=districtList) 
+CrimeData.eval_district$Pred_mesh <- rep(0,nrow(CrimeData.eval_district))
+CrimeData.eval_district$Pred_LT <- rep(0,nrow(CrimeData.eval_district))
+CrimeData.eval_district$Pred_histMonth <- rep(0,nrow(CrimeData.eval_district))
+CrimeData.eval_district$Pred_histDOW <- rep(0,nrow(CrimeData.eval_district))
+CrimeData.eval_district$Pred_recentDOW <- rep(0,nrow(CrimeData.eval_district))
+```
+
+```{r baseline-district,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+for (i in 1:NumDays.eval){
+  d <- dateSeq.eval[i]
+  d.year <- as.integer(format(d,"%Y"))
+  d.month <- as.integer(format(d,"%m"))
+  d.dow <- weekdays(d)
+  CrimeData.district_day_long <- subset(CrimeData.district_day,YEAR>=(d.year-5) & YEAR<d.year,select=c("DATEOCC","MONTH","DISTRICT","INC_CNT"))
+  CrimeData.district_day_histMonth <- subset(CrimeData.district_day_long,MONTH==d.month,select=c("DATEOCC","DISTRICT","INC_CNT"))
+  CrimeData.district_day_histDOW <- subset(CrimeData.district_day_long,MONTH==d.month & weekdays(DATEOCC)==d.dow,
+                                       select=c("DATEOCC","DISTRICT","INC_CNT"))
+  CrimeData.district_day_recentDOW <- subset(CrimeData.district_day,DATEOCC>=d-period.short & DATEOCC<=d-1 & weekdays(DATEOCC)==d.dow,
+                                         select=c("DATEOCC","DISTRICT","INC_CNT"))
+  for (j in districtList){
+    targetIdx <- CrimeData.eval_district$DISTRICT==j&CrimeData.eval_district$DATEOCC==d
+    DistrictCnt.long <- subset(CrimeData.district_day_long,DISTRICT==j)
+    DistrictCnt.histMonth <- subset(CrimeData.district_day_histMonth,DISTRICT==j)
+    DistrictCnt.histDOW <- subset(CrimeData.district_day_histDOW,DISTRICT==j)
+    DistrictCnt.recentDOW <- subset(CrimeData.district_day_recentDOW,DISTRICT==j)
+    # Some districts may have no incident records during the long/short periods
+    if (nrow(DistrictCnt.long)==0){
+      CrimeData.eval_district$Pred_LT[targetIdx] <- 0
+      CrimeData.eval_district$Pred_histMonth[targetIdx] <- 0
+      CrimeData.eval_district$Pred_histDOW[targetIdx] <- 0
+      CrimeData.eval_district$Pred_recentDOW[targetIdx] <- 0
+    }else if (nrow(DistrictCnt.histMonth)==0){
+      CrimeData.eval_district$Pred_histMonth[targetIdx] <- 0
+      CrimeData.eval_district$Pred_histDOW[targetIdx] <- 0
+    }else if (nrow(DistrictCnt.histDOW)==0){
+      CrimeData.eval_district$Pred_histDOW[targetIdx] <- 0
+    }else if (nrow(DistrictCnt.recentDOW)==0){
+      CrimeData.eval_district$Pred_recentDOW[targetIdx] <- 0
+    }else{
+      CrimeData.eval_district$Pred_LT[targetIdx] <- mean(DistrictCnt.long$INC_CNT)
+      CrimeData.eval_district$Pred_histMonth[targetIdx] <- mean(DistrictCnt.histMonth$INC_CNT)
+      CrimeData.eval_district$Pred_histDOW[targetIdx] <- mean(DistrictCnt.histDOW$INC_CNT) 
+      CrimeData.eval_district$Pred_recentDOW[targetIdx] <- mean(DistrictCnt.recentDOW$INC_CNT) 
+    }
+  }
+}
+```
+
+```{r district-rate-sum,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+DistrictPred.mesh <- rowsum(RateMap_mesh.eval,group=GrdInDistrict$DISTRICT,reorder=TRUE,na.rm=TRUE)
+for (i in 1:NumDays.eval){
+  CrimeData.eval_district$Pred_mesh[CrimeData.eval_district$DATEOCC==dateSeq.eval[i]] <- DistrictPred.mesh[,i]
+}
+```
+
+```{r eval-district-dataframe,echo=FALSE, message=FALSE, warning=FALSE, cache=TRUE}
+evalnames.district <-c('DISTRICT','MODEL','MSE','pMSE','RMSE','pRMSE')
+EvalResults.district <- data.frame(matrix(0,nrow=NumDistrict*NumModel,ncol=length(evalnames.district)))
+names(EvalResults.district) <- evalnames.district
+
+EvalResults.district$DISTRICT <- rep(districtList,each=NumModel)
+
+EvalResults.district$MODEL <- factor(rep(models,times=NumDistrict))
+idx.model <- matrix(FALSE,nrow=nrow(EvalResults.district),ncol=NumModel)
+for (i in 1:NumModel){
+  idx.model[,i] <- EvalResults.district$MODEL==models[i]
+}
+
+for (i in districtList){
+  DistrictRecord <- subset(CrimeData.eval_district,DISTRICT==i,select=c("INC_CNT","Pred_mesh","Pred_LT","Pred_histMonth","Pred_histDOW","Pred_recentDOW"))
+  
+  idx.district <- EvalResults.district$DISTRICT==i
+  
+  EvalResults.district$MSE[idx.district&idx.model[,1]] <- with(DistrictRecord,MSE(INC_CNT,Pred_mesh))
+  EvalResults.district$MSE[idx.district&idx.model[,2]] <- with(DistrictRecord,MSE(INC_CNT,Pred_LT))
+  EvalResults.district$MSE[idx.district&idx.model[,3]] <- with(DistrictRecord,MSE(INC_CNT,Pred_histMonth))
+  EvalResults.district$MSE[idx.district&idx.model[,4]] <- with(DistrictRecord,MSE(INC_CNT,Pred_histDOW))
+  EvalResults.district$MSE[idx.district&idx.model[,5]] <- with(DistrictRecord,MSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.district$pMSE[idx.district&idx.model[,1]] <- with(DistrictRecord,percentMSE(INC_CNT,Pred_mesh))
+  EvalResults.district$pMSE[idx.district&idx.model[,2]] <- with(DistrictRecord,percentMSE(INC_CNT,Pred_LT))
+  EvalResults.district$pMSE[idx.district&idx.model[,3]] <- with(DistrictRecord,percentMSE(INC_CNT,Pred_histMonth))
+  EvalResults.district$pMSE[idx.district&idx.model[,4]] <- with(DistrictRecord,percentMSE(INC_CNT,Pred_histDOW))
+  EvalResults.district$pMSE[idx.district&idx.model[,5]] <- with(DistrictRecord,percentMSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.district$RMSE[idx.district&idx.model[,1]] <- with(DistrictRecord,RMSE(INC_CNT,Pred_mesh))
+  EvalResults.district$RMSE[idx.district&idx.model[,2]] <- with(DistrictRecord,RMSE(INC_CNT,Pred_LT))
+  EvalResults.district$RMSE[idx.district&idx.model[,3]] <- with(DistrictRecord,RMSE(INC_CNT,Pred_histMonth))
+  EvalResults.district$RMSE[idx.district&idx.model[,4]] <- with(DistrictRecord,RMSE(INC_CNT,Pred_histDOW))
+  EvalResults.district$RMSE[idx.district&idx.model[,5]] <- with(DistrictRecord,RMSE(INC_CNT,Pred_recentDOW))
+  
+  EvalResults.district$pRMSE[idx.district&idx.model[,1]] <- with(DistrictRecord,percentRMSE(INC_CNT,Pred_mesh))
+  EvalResults.district$pRMSE[idx.district&idx.model[,2]] <- with(DistrictRecord,percentRMSE(INC_CNT,Pred_LT))
+  EvalResults.district$pRMSE[idx.district&idx.model[,3]] <- with(DistrictRecord,percentRMSE(INC_CNT,Pred_histMonth))
+  EvalResults.district$pRMSE[idx.district&idx.model[,4]] <- with(DistrictRecord,percentRMSE(INC_CNT,Pred_histDOW))
+  EvalResults.district$pRMSE[idx.district&idx.model[,5]] <- with(DistrictRecord,percentRMSE(INC_CNT,Pred_recentDOW))
+}
+```
+
+```{r plot-district-eval,echo=FALSE, message=FALSE, warning=FALSE, fig.width=7,fig.height=5.5, fig.align='center', eval=TRUE,cache=TRUE}
+metrics <- c('MSE','pMSE')
+metricNames <- c('MSE','MSE%')
+for (j in 1:length(metrics)){
+  par(mfrow=c(1,1),mar=c(5.1, 4.1, 4.1, 2.1),pty='m')
+  # reshape to contingency-table form (long-format to wide-format)
+  EvalResults.district_wide <- stats::reshape(EvalResults.district[,c('DISTRICT','MODEL',metrics[j])],direction='wide',v.names=metrics[j],timevar='DISTRICT',idvar='MODEL')
+  names(EvalResults.district_wide)[-1] <- as.character(sort(unique(EvalResults.district$DISTRICT)))
+  barplot(as.matrix(EvalResults.district_wide[,-1]), xlab="DISTRICT",ylab=metricNames[j], 
+          col=rainbow(length(models)), beside=TRUE,cex.lab=0.7,cex.axis=0.6)
+
+  par(new=TRUE)
+  plot(0, 0, type="n", bty="n", xaxt="n", yaxt="n",xlab="",ylab="")
+  legend(x="top",inset=c(0,0), legend=models, pch=15, col=rainbow(length(models)), 
+         cex=0.5, horiz=TRUE,xpd=TRUE)
+}
+```
