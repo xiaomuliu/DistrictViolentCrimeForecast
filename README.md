@@ -4,11 +4,11 @@ Distribute daily citywide violent crime count predications through spatial crime
 Evaluation: 2013-2014 daily violent crime count predictions over 22 police district in Chicago.
 
 *Evaluation example*  
-1 .Tomorrow's forecast - Friday, Aug 12, 2016. [*red*]  
-2. historical overall average number of crimes for a given District/Beat (how different is tomorrow from an average day in the past 5 years?) [*yellow*]  
-3. same, but for a given time of year (how different is tomorrow from an average August day in the past 5 years?) [*green*]  
-4. same, but for a given day-of-week at a given time of year (how different is tomorrow compared with an average Friday in August in the past 5 years?) [*blue*]  
-5. same, but for the three most recent Fridays [*purple*]  
+Tomorrow's forecast - Friday, Aug 12, 2016. [*red*]  
+Baseline 1. historical overall average number of crimes for a given District/Beat (how different is tomorrow from an average day in the past 5 years?) [*yellow*]  
+Baseline 2. same, but for a given time of year (how different is tomorrow from an average August day in the past 5 years?) [*green*]  
+Baseline 3. same, but for a given day-of-week at a given time of year (how different is tomorrow compared with an average Friday in August in the past 5 years?) [*blue*]  
+Baseline 4. same, but for the three most recent Fridays [*purple*]  
 
 Median absolute percentage error
 ![alt text](https://github.com/xiaomuliu/DistrictViolentCrimeForecast/blob/master/MdAPE_district.png)
